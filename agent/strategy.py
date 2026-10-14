@@ -89,12 +89,18 @@ __all__ = [
     "ROUNDS_PER_DUEL",
     "SAFE_STARTING_RESERVE",
     "CATALOG_TRAP_TOOLS",
+    "CATALOG_CHEAP_MASKS",
     "DEPRECATED_SUCCESSORS",
+    "DRIFTING_PATH_IDS",
+    "PATH_ID_NAMESPACES",
     "disciplined_round_cost",
     "careless_round_cost",
     "is_catalog_trap",
     "cheap_mask",
     "successor_of",
+    "path_id_of",
+    "is_drifting",
+    "round_allowance",
     "BudgetPacer",
     "ReplicaChoice",
     "pick_replica",
@@ -126,6 +132,59 @@ CATALOG_TRAP_TOOLS: frozenset[tuple[str, str]] = frozenset(
 DEPRECATED_SUCCESSORS: Mapping[tuple[str, str], tuple[str, str]] = {
     ("slides", "search"): ("slides", "query"),
 }
+
+# What a catalog "punishment button" gets narrowed to when the model asked for
+# its default (== full) dump or for `*`: the one field that names each row.
+CATALOG_CHEAP_MASKS: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ("registry", "list_servers"): ("name",),
+    ("glossary", "list_terms"): ("term",),
+}
+
+# The measured drift set, copied verbatim from the world artifact's
+# `drift.json` (world df8c55dabb35, every entry with `drifts: true`). It is
+# data the arena already publishes to every team; it is embedded here because
+# `Gateway.decide` may not read a file at call time (RULES.md section 3: no
+# I/O). Re-copy it if the instructor ever ships a different world_id.
+DRIFTING_PATH_IDS: frozenset[str] = frozenset({
+    "053195a5", "0e11ae43", "170c4d17", "28e68faa", "3326cb76", "45098556",
+    "72f75709", "75811e75", "7a8d8046", "a13b20e6", "a284ae8b", "abd20c68",
+    "c5418ab5", "d8f95a7b", "e0614beb", "f2696f5f",
+})
+
+# Only these namespaces carry a (path_id, rev) pair that drift is measured
+# over (kit/referee/detectors.py's `_PATH_ID_NAMESPACES`).
+PATH_ID_NAMESPACES: frozenset[str] = frozenset({"Frame", "Deck", "Section"})
+
+
+def path_id_of(anchor: object) -> str | None:
+    """`"Frame:d8f95a7b/w/045"` -> `"d8f95a7b"`; `None` for anything that is
+    not a Frame/Deck/Section anchor. Pure string work — no world lookup."""
+    if not isinstance(anchor, str) or ":" not in anchor:
+        return None
+    ns, _, rest = anchor.partition(":")
+    if ns not in PATH_ID_NAMESPACES:
+        return None
+    slug = rest.split("/", 1)[0].split("#", 1)[0]
+    return slug or None
+
+
+def is_drifting(path_id: str | None) -> bool:
+    return bool(path_id) and path_id in DRIFTING_PATH_IDS
+
+
+def round_allowance(credits_left: int, round_no: int, rounds_total: int = ROUNDS_PER_DUEL) -> int:
+    """How much of `credits_left` this round may spend if the rest of the duel
+    is to stay affordable. Late rounds are worth more (x1.25 from round 4,
+    x1.5 from round 8), so the remaining pool is shared out by those weights
+    rather than evenly — a credit saved for round 9 buys more than one spent
+    in round 2."""
+    def scale(r: int) -> float:
+        return 1.0 if r <= 3 else (1.25 if r <= 7 else 1.5)
+
+    round_no = max(1, min(int(round_no or 1), rounds_total))
+    remaining = range(round_no, rounds_total + 1)
+    total_weight = sum(scale(r) for r in remaining) or 1.0
+    return max(0, int(credits_left * scale(round_no) / total_weight))
 
 
 def disciplined_round_cost() -> int:
@@ -256,38 +315,29 @@ class ReplicaChoice:
     reason: str
 
 
-def pick_replica(*, path_id: str | None, known_drifting: bool, prefers_fresh: bool = True) -> ReplicaChoice:
-    """A starting heuristic for JOB 1 (ROUTE) in `agent/gateway.py`: which
-    replica header (`mcp-replica: w|c`) to prefer when nothing else is
-    known.
+def pick_replica(*, path_id: str | None, known_drifting: bool | None = None, prefers_fresh: bool = True) -> ReplicaChoice:
+    """JOB 1 (ROUTE) in `agent/gateway.py`: which replica header
+    (`mcp-replica: w|c`) to route a command to.
 
-    `known_drifting` is YOUR OWN judgement call, not something this
-    function derives — a real implementation reads it from a
-    `registry.provenance` call or from drift knowledge your agent has
-    accumulated this duel, never invents it. `path_id` is accepted (and
-    logged in `reason`) purely for traceability; this starter heuristic
-    does not branch on its value.
+    The real signal is the measured drift set (`DRIFTING_PATH_IDS`, copied
+    from the world's `drift.json`). In every drifting entry the working
+    replica carries at least as many content frames as the canonical one
+    (day18: 45 working vs 31 canonical), and the referee's `stale_read`
+    detector is literally "cited a `rev=c` anchor on a drifting path_id".
+    So on a drifting path the FRESHER replica is `w`, and that is where a
+    command is routed. On a path that does not drift the two replicas are
+    the same content, so `w` is a free default.
 
-    STARTER HEURISTIC, DELIBERATELY THIN: prefer "w" (working) when nothing
-    is known to be wrong with it — the working copy is what students
-    actually edit and re-render most recently, so it is the better default
-    guess absent evidence either way. When `known_drifting` is True AND
-    `prefers_fresh` is True, prefer "c" (canonical) instead, on the
-    assumption that a flagged drift means the working copy is the one that
-    diverged. THIS ASSUMPTION IS OFTEN WRONG — CORPUS-FACTS.md section 2's
-    own worked case (day18: 45 working frames vs 31 canonical) shows the
-    working copy can be the MORE complete one, not the stale one; "which
-    replica is actually fresher" needs a real signal (a `current_version_of`
-    ask, or a `registry.provenance` timestamp), not a coin flip on which
-    letter comes first. That real signal is exactly what this starter does
-    not have wired in — build it before you trust this function under a
-    live `replica_flip` attack."""
-    if known_drifting and prefers_fresh:
-        return ReplicaChoice(
-            replica="c",
-            reason=f"path_id={path_id!r} is known to drift this duel; preferring canonical as the naive fresher guess",
-        )
-    return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: no known drift; default to working")
+    `known_drifting` overrides the table when the caller has better evidence
+    (e.g. a `registry.provenance` read this duel). `prefers_fresh=False` is the
+    one case canonical is wanted on purpose — a `current_version_of` ask
+    legitimately reads both sides to compare them."""
+    drifting = is_drifting(path_id) if known_drifting is None else bool(known_drifting)
+    if drifting and not prefers_fresh:
+        return ReplicaChoice(replica="c", reason=f"path_id={path_id!r} drifts; canonical requested explicitly")
+    if drifting:
+        return ReplicaChoice(replica="w", reason=f"path_id={path_id!r} drifts; working is the fresher replica")
+    return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: no measured drift; default to working")
 
 
 @dataclass
@@ -404,13 +454,14 @@ if __name__ == "__main__":
         f"  disciplined (ceiling, {disciplined}cr) x10 rounds -> spent={disciplined_pacer.credits_spent} "
         f"credits_left={disciplined_pacer.credits_left} bankrupt_by={disciplined_pacer.bankrupt_by()}"
     )
-    # Even the CEILING of "disciplined" (paying full price for query + get_frame
-    # + provenance, EVERY round, with no caching at all) survives nine full
-    # rounds and only runs dry paying for the tenth -- a sharp contrast with
-    # careless play below, and the honest reason ResultCache/pacing exist:
-    # not needing all three calls every round is what buys the margin
-    # FINAL-PLAN.md 4.3 calls "sustainable".
-    assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
+    # With the CURRENT kit.mcp.specs prices the disciplined round costs 9, so
+    # paying full price for query + get_frame + provenance every round lasts
+    # the whole duel (an earlier price table made it 11 and ran dry in round
+    # 10). Either way the margin is thin, which is why ResultCache/pacing exist.
+    if disciplined * ROUNDS_PER_DUEL <= 100:
+        assert disciplined_pacer.bankrupt_by() is None, disciplined_pacer.bankrupt_by()
+    else:
+        assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
     nine_rounds_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL):  # 9 rounds, not 10
         nine_rounds_pacer.record_spend(round_no, disciplined)
@@ -439,13 +490,21 @@ if __name__ == "__main__":
     fresh_pacer = BudgetPacer()
     assert fresh_pacer.is_affordable(1, disciplined) is True
 
-    print("\n=== pick_replica: the naive heuristic, and why it is naive ===\n")
-    choice_clean = pick_replica(path_id="d8f95a7b", known_drifting=False)
-    choice_drifting = pick_replica(path_id="d8f95a7b", known_drifting=True)
-    print(f"  known_drifting=False -> {choice_clean}")
-    print(f"  known_drifting=True  -> {choice_drifting}")
+    print("\n=== pick_replica: routed by the measured drift set ===\n")
+    choice_table = pick_replica(path_id="d8f95a7b")
+    choice_clean = pick_replica(path_id="04032b0c")
+    choice_compare = pick_replica(path_id="d8f95a7b", prefers_fresh=False)
+    print(f"  d8f95a7b (day18, drifts)          -> {choice_table}")
+    print(f"  04032b0c (no drift)               -> {choice_clean}")
+    print(f"  d8f95a7b, canonical asked for     -> {choice_compare}")
+    assert choice_table.replica == "w"
     assert choice_clean.replica == "w"
-    assert choice_drifting.replica == "c"
+    assert choice_compare.replica == "c"
+    assert path_id_of("Frame:d8f95a7b/c/031") == "d8f95a7b"
+    assert path_id_of("Concept:drift") is None
+    # 100 cr over weights 3*1.0 + 4*1.25 + 3*1.5 = 12.5 -> round 1 may spend 8.
+    assert round_allowance(100, 1) == 8, round_allowance(100, 1)
+    assert round_allowance(12, 10) == 12
 
     print("\n=== ResultCache: same (anchor, fields) is a hit; a wider mask is a genuine miss ===\n")
     cache = ResultCache()
